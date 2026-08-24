@@ -4722,6 +4722,35 @@ class TestNativeTaskCardProgress:
         ).native_task_cards_enabled() is False
 
     @pytest.mark.asyncio
+    async def test_native_chunks_do_not_mix_markdown_fallback(self, adapter):
+        client = adapter._app.client
+
+        async def api_call(method, *, json):
+            if method == "chat.startStream":
+                return {"ts": "stream-1"}
+            if method == "chat.appendStream":
+                if "chunks" in json and "markdown_text" in json:
+                    raise RuntimeError(
+                        "cannot_provide_both_markdown_text_and_chunks"
+                    )
+                return {"ok": True}
+            raise AssertionError(f"unexpected Slack method: {method}")
+
+        client.api_call.side_effect = api_call
+
+        result = await adapter.send_native_task_card_progress(
+            "C1",
+            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+            metadata={"thread_id": "thread-1"},
+            fallback_text="Hermes is working",
+        )
+
+        assert result.success is True
+        append_payload = client.api_call.await_args_list[1].kwargs["json"]
+        assert "chunks" in append_payload
+        assert "markdown_text" not in append_payload
+
+    @pytest.mark.asyncio
     async def test_native_updates_are_serialized_and_workspace_scoped(self, adapter):
         team_client = AsyncMock()
         start_count = 0
