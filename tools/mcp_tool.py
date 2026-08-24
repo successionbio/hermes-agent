@@ -138,6 +138,29 @@ logger = logging.getLogger(__name__)
 _MCP_HARD_RESULT_CAP_CHARS = 2_000_000
 
 
+# MCP servers may declare that selected top-level arguments must come from
+# Hermes' authenticated session context instead of the model. Only these
+# gateway-owned values are eligible for binding; rejecting unknown names
+# prevents a server (or a tampered lazy-schema cache) from reading arbitrary
+# process environment variables.
+_MCP_SESSION_ENV_ALLOWLIST = frozenset({
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_TYPE",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_ID_ALT",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_SCOPE_ID",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_MESSAGE_ID",
+    "HERMES_SESSION_PROFILE",
+})
+
+
 def _truncate_mcp_text_result(text: str, max_chars: int = _MCP_HARD_RESULT_CAP_CHARS) -> str:
     """Bound pathological MCP text before it propagates (#56059).
 
@@ -5768,7 +5791,98 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _extract_mcp_session_bindings(input_schema: Any) -> Dict[str, Dict[str, str]]:
+    """Return validated host-bound argument declarations from an MCP schema."""
+    if not isinstance(input_schema, dict):
+        return {}
+    properties = input_schema.get("properties")
+    if not isinstance(properties, dict):
+        return {}
+
+    bindings: Dict[str, Dict[str, str]] = {}
+    for argument_name, property_schema in properties.items():
+        if not isinstance(property_schema, dict):
+            continue
+        env_name = property_schema.get("x-hermes-session-env")
+        if env_name is None:
+            continue
+        if not isinstance(argument_name, str) or not argument_name:
+            raise ValueError("MCP session-bound argument names must be non-empty strings")
+        if env_name not in _MCP_SESSION_ENV_ALLOWLIST:
+            raise ValueError(
+                f"MCP argument '{argument_name}' requests unsupported Hermes session value"
+            )
+
+        binding = {"env": env_name}
+        required_platform = property_schema.get("x-hermes-required-platform")
+        if required_platform is not None:
+            if not isinstance(required_platform, str) or not required_platform.strip():
+                raise ValueError(
+                    f"MCP argument '{argument_name}' has an invalid required platform"
+                )
+            binding["required_platform"] = required_platform.strip().lower()
+        bindings[argument_name] = binding
+    return bindings
+
+
+def _strip_mcp_session_bound_arguments(
+    input_schema: dict,
+    bindings: Dict[str, Dict[str, str]],
+) -> dict:
+    """Hide host-bound arguments from the schema presented to the model."""
+    if not bindings:
+        return input_schema
+
+    stripped = dict(input_schema)
+    properties = dict(stripped.get("properties") or {})
+    for argument_name in bindings:
+        properties.pop(argument_name, None)
+    stripped["properties"] = properties
+
+    required = stripped.get("required")
+    if isinstance(required, list):
+        remaining = [name for name in required if name not in bindings]
+        if remaining:
+            stripped["required"] = remaining
+        else:
+            stripped.pop("required", None)
+    return stripped
+
+
+def _bind_mcp_session_arguments(
+    args: Any,
+    bindings: Dict[str, Dict[str, str]],
+) -> dict:
+    """Overwrite declared arguments with trusted values from this session."""
+    effective_args = dict(args) if isinstance(args, dict) else {}
+    if not bindings:
+        return effective_args
+
+    from gateway.session_context import get_session_env
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    for argument_name, binding in bindings.items():
+        required_platform = binding.get("required_platform")
+        if required_platform and platform != required_platform:
+            raise ValueError(
+                f"MCP tool requires an authenticated {required_platform} session"
+            )
+        value = get_session_env(binding["env"], "")
+        if not value:
+            raise ValueError(
+                f"MCP tool is missing required authenticated session context for "
+                f"'{argument_name}'"
+            )
+        effective_args[argument_name] = value
+    return effective_args
+
+
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    session_bindings: Optional[Dict[str, Dict[str, str]]] = None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -5776,6 +5890,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        try:
+            effective_args = _bind_mcp_session_arguments(
+                args, session_bindings or {}
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
+
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
@@ -5852,7 +5973,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await server.session.call_tool(
+                        tool_name, arguments=effective_args
+                    )
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -6500,13 +6623,16 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
         A dict suitable for ``registry.register(schema=...)``.
     """
     prefixed_name = mcp_prefixed_tool_name(server_name, mcp_tool.name)
+    raw_input_schema = mcp_field(mcp_tool, "input_schema", "inputSchema")
+    session_bindings = _extract_mcp_session_bindings(raw_input_schema)
+    normalized_input_schema = _normalize_mcp_input_schema(raw_input_schema)
     return {
         "name": prefixed_name,
         "description": strip_unicode_tags(
             mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}"
         ),
-        "parameters": _normalize_mcp_input_schema(
-            mcp_field(mcp_tool, "input_schema", "inputSchema")
+        "parameters": _strip_mcp_session_bound_arguments(
+            normalized_input_schema, session_bindings
         ),
     }
 
@@ -6836,6 +6962,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             continue
 
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
+        raw_input_schema = mcp_field(mcp_tool, "input_schema", "inputSchema")
+        session_bindings = _extract_mcp_session_bindings(raw_input_schema)
         schema = _convert_mcp_schema(name, mcp_tool)
         candidates.append(
             {
@@ -6843,7 +6971,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name,
+                    mcp_tool.name,
+                    server.tool_timeout,
+                    session_bindings=session_bindings,
                 ),
                 "check_fn": check_fn,
             }
@@ -7111,6 +7242,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         # Defense-in-depth: the cache file is user-writable JSON, so run the
         # same injection scan the eager discovery path applies.
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
+        session_bindings = _extract_mcp_session_bindings(raw_schema)
         schema = _convert_mcp_schema(name, mcp_tool)
         registry_name = schema["name"]
         existing_toolset = registry.get_toolset_for_tool(registry_name)
@@ -7125,7 +7257,12 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
+            handler=_make_tool_handler(
+                name,
+                raw_name,
+                tool_timeout,
+                session_bindings=session_bindings,
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],

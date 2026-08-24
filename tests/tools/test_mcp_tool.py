@@ -367,6 +367,50 @@ class TestSchemaConversion:
         assert schema["description"] == "Read a file"
         assert "properties" in schema["parameters"]
 
+    def test_hides_session_bound_arguments_from_model_schema(self):
+        from tools.mcp_tool import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(
+            name="list_mail",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "client_domain": {"type": "string"},
+                    "operator_slack_id": {
+                        "type": "string",
+                        "x-hermes-session-env": "HERMES_SESSION_USER_ID",
+                        "x-hermes-required-platform": "slack",
+                    },
+                },
+                "required": ["client_domain", "operator_slack_id"],
+            },
+        )
+
+        schema = _convert_mcp_schema("workspace", mcp_tool)
+
+        assert schema["parameters"]["properties"] == {
+            "client_domain": {"type": "string"}
+        }
+        assert schema["parameters"]["required"] == ["client_domain"]
+
+    def test_rejects_session_binding_to_arbitrary_environment_variable(self):
+        from tools.mcp_tool import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "secret": {
+                        "type": "string",
+                        "x-hermes-session-env": "AWS_SECRET_ACCESS_KEY",
+                    }
+                },
+            },
+        )
+
+        with pytest.raises(ValueError, match="unsupported Hermes session value"):
+            _convert_mcp_schema("unsafe", mcp_tool)
+
     def test_definitions_as_property_name_is_preserved(self):
         """A tool parameter literally named ``definitions`` must not be renamed.
 
@@ -575,6 +619,80 @@ class TestToolHandler:
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
             _servers.pop("test_srv", None)
+
+    def test_session_binding_overwrites_model_supplied_identity(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        session_values = {
+            "HERMES_SESSION_PLATFORM": "slack",
+            "HERMES_SESSION_USER_ID": "U_TRUSTED",
+        }
+
+        try:
+            handler = _make_tool_handler(
+                "test_srv",
+                "list_mail",
+                120,
+                session_bindings={
+                    "operator_slack_id": {
+                        "env": "HERMES_SESSION_USER_ID",
+                        "required_platform": "slack",
+                    }
+                },
+            )
+            with patch(
+                "gateway.session_context.get_session_env",
+                side_effect=lambda name, default="": session_values.get(name, default),
+            ), self._patch_mcp_loop():
+                result = json.loads(handler({
+                    "client_domain": "example.com",
+                    "operator_slack_id": "U_ATTACKER_CHOICE",
+                }))
+
+            assert result["result"] == "ok"
+            mock_session.call_tool.assert_called_once_with(
+                "list_mail",
+                arguments={
+                    "client_domain": "example.com",
+                    "operator_slack_id": "U_TRUSTED",
+                },
+            )
+        finally:
+            _servers.pop("test_srv", None)
+
+    def test_session_binding_fails_closed_outside_required_platform(self):
+        from tools.mcp_tool import _make_tool_handler
+
+        handler = _make_tool_handler(
+            "test_srv",
+            "list_mail",
+            120,
+            session_bindings={
+                "operator_slack_id": {
+                    "env": "HERMES_SESSION_USER_ID",
+                    "required_platform": "slack",
+                }
+            },
+        )
+        session_values = {
+            "HERMES_SESSION_PLATFORM": "cli",
+            "HERMES_SESSION_USER_ID": "U_TRUSTED",
+        }
+
+        with patch(
+            "gateway.session_context.get_session_env",
+            side_effect=lambda name, default="": session_values.get(name, default),
+        ):
+            result = json.loads(handler({}))
+
+        assert "error" in result
+        assert "authenticated slack session" in result["error"]
 
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
