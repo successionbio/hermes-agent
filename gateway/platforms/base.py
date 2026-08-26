@@ -6616,6 +6616,45 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    if getattr(result, "success", False) and getattr(
+                        result, "message_id", None
+                    ):
+                        # Observer-only final-delivery boundary. Dispatch via
+                        # the host-owned bounded queue so plugin work never
+                        # delays the platform ACK path or creates a duplicate
+                        # send. The envelope intentionally excludes message
+                        # content and raw adapter/SDK objects.
+                        try:
+                            from agent.plugin_stream_hooks import (
+                                enqueue_plugin_stream_hook,
+                            )
+
+                            enqueue_plugin_stream_hook(
+                                "gateway_message_delivered",
+                                platform=str(
+                                    getattr(
+                                        event.source.platform,
+                                        "value",
+                                        event.source.platform,
+                                    )
+                                ),
+                                chat_id=str(event.source.chat_id),
+                                thread_id=(
+                                    str(event.source.thread_id)
+                                    if getattr(event.source, "thread_id", None)
+                                    else None
+                                ),
+                                message_id=str(result.message_id),
+                                success=True,
+                                is_final=True,
+                                is_ephemeral=bool(is_ephemeral_response),
+                                session_key=str(session_key),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "gateway_message_delivered observer enqueue failed",
+                                exc_info=True,
+                            )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (

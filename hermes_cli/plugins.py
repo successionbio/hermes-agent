@@ -365,6 +365,14 @@ VALID_HOOKS: Set[str] = {
     #       payload contracts; no inert VALID_HOOKS surface is registered
     #       ahead of implementation.
     "gateway_platform_event",
+    # Normalized observer for a gateway turn's completed user-visible message.
+    # Fired only after the platform acknowledges a successful non-streaming
+    # final send. Raw content, SDK responses, adapters, and bot clients are
+    # deliberately excluded. Callbacks run through the host-owned bounded
+    # observer queue and cannot delay or break delivery.
+    # Kwargs: platform, chat_id, thread_id, message_id, success=True,
+    #   is_final=True, is_ephemeral, session_key.
+    "gateway_message_delivered",
     # Slash-command dispatch observer (#64204, observer-first per #64182
     # ground rule 3). Fired when a recognized slash command is about to be
     # dispatched, BEFORE the handler runs, on both the interactive CLI

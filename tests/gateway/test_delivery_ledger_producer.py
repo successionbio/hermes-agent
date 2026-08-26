@@ -53,7 +53,10 @@ def _event(text="hello agent"):
         text=text,
         message_type=MessageType.TEXT,
         source=SessionSource(
-            platform=Platform.SLACK, chat_id="C1", chat_type="channel"
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="channel",
+            thread_id="1712345678.000100",
         ),
         message_id="msg-42",
     )
@@ -99,6 +102,38 @@ async def _run(adapter, event, response="final answer"):
 
 
 class TestProducerHook:
+    @pytest.mark.asyncio
+    async def test_final_send_queues_normalized_delivery_observer(self):
+        adapter = _Adapter()
+        with patch(
+            "agent.plugin_stream_hooks.enqueue_plugin_stream_hook"
+        ) as enqueue:
+            await _run(adapter, _event())
+
+        enqueue.assert_called_once_with(
+            "gateway_message_delivered",
+            platform="slack",
+            chat_id="C1",
+            thread_id="1712345678.000100",
+            message_id="m1",
+            success=True,
+            is_final=True,
+            is_ephemeral=False,
+            session_key="agent:main:slack:channel:C1",
+        )
+        assert "content" not in enqueue.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_delivery_observer_enqueue_failure_never_blocks_reply(self):
+        adapter = _Adapter()
+        with patch(
+            "agent.plugin_stream_hooks.enqueue_plugin_stream_hook",
+            side_effect=RuntimeError("observer unavailable"),
+        ):
+            await _run(adapter, _event())
+
+        assert adapter.sent == ["final answer"]
+
     @pytest.mark.asyncio
     async def test_normal_turn_records_and_delivers(self):
         adapter = _Adapter()
