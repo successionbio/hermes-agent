@@ -4513,6 +4513,21 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _cron_response_for_context(saved_output: str) -> str:
+    """Return the agent response from a saved cron transcript.
+
+    Cron output files retain the assembled prompt for diagnosis, which can be
+    much larger than the response and may contain untrusted script input.
+    ``context_from`` is an output handoff, so wrapped cron transcripts should
+    pass only their final response. Plain legacy output remains unchanged.
+    """
+    output = saved_output.strip()
+    response_marker = "\n## Response\n\n"
+    if output.startswith("# Cron Job:") and response_marker in output:
+        return output.rsplit(response_marker, 1)[1].strip()
+    return output
+
+
 def _build_job_prompt(
     job: dict,
     prerun_script: Optional[tuple] = None,
@@ -4612,7 +4627,9 @@ def _build_job_prompt(
                 )
                 if not output_files:
                     continue  # silent skip — no output yet
-                latest_output = output_files[0].read_text(encoding="utf-8").strip()
+                latest_output = _cron_response_for_context(
+                    output_files[0].read_text(encoding="utf-8")
+                )
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
