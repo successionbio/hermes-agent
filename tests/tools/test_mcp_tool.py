@@ -411,6 +411,28 @@ class TestSchemaConversion:
         with pytest.raises(ValueError, match="unsupported Hermes session value"):
             _convert_mcp_schema("unsafe", mcp_tool)
 
+    def test_allows_trusted_cron_session_binding(self):
+        from tools.mcp_tool import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(
+            name="scheduled_work",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "cron_session": {
+                        "type": "string",
+                        "const": "1",
+                        "x-hermes-session-env": "HERMES_CRON_SESSION",
+                    }
+                },
+                "required": ["cron_session"],
+            },
+        )
+
+        schema = _convert_mcp_schema("workspace", mcp_tool)
+        assert schema["parameters"]["properties"] == {}
+        assert "required" not in schema["parameters"]
+
     def test_definitions_as_property_name_is_preserved(self):
         """A tool parameter literally named ``definitions`` must not be renamed.
 

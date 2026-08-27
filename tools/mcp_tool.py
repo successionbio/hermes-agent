@@ -144,6 +144,7 @@ _MCP_HARD_RESULT_CAP_CHARS = 2_000_000
 # prevents a server (or a tampered lazy-schema cache) from reading arbitrary
 # process environment variables.
 _MCP_SESSION_ENV_ALLOWLIST = frozenset({
+    "HERMES_CRON_SESSION",
     "HERMES_SESSION_PLATFORM",
     "HERMES_SESSION_SOURCE",
     "HERMES_SESSION_CHAT_ID",
