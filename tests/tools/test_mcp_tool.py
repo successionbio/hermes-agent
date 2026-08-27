@@ -433,6 +433,28 @@ class TestSchemaConversion:
         assert schema["parameters"]["properties"] == {}
         assert "required" not in schema["parameters"]
 
+    def test_allows_trusted_session_workspace_binding(self):
+        from tools.mcp_tool import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(
+            name="track_work",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "workspace_path": {
+                        "type": "string",
+                        "x-hermes-session-env": "HERMES_SESSION_WORKSPACE",
+                        "x-hermes-required-platform": "slack",
+                    }
+                },
+                "required": ["workspace_path"],
+            },
+        )
+
+        schema = _convert_mcp_schema("workspace", mcp_tool)
+        assert schema["parameters"]["properties"] == {}
+        assert "required" not in schema["parameters"]
+
     def test_definitions_as_property_name_is_preserved(self):
         """A tool parameter literally named ``definitions`` must not be renamed.
 
@@ -684,6 +706,51 @@ class TestToolHandler:
                     "client_domain": "example.com",
                     "operator_slack_id": "U_TRUSTED",
                 },
+            )
+        finally:
+            _servers.pop("test_srv", None)
+
+    def test_session_workspace_binding_reaches_the_mcp_call(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("ok", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        session_values = {
+            "HERMES_SESSION_PLATFORM": "slack",
+            "HERMES_SESSION_WORKSPACE": "/private/session-workspace",
+        }
+
+        try:
+            handler = _make_tool_handler(
+                "test_srv",
+                "track_work",
+                120,
+                session_bindings={
+                    "workspace_path": {
+                        "env": "HERMES_SESSION_WORKSPACE",
+                        "required_platform": "slack",
+                    }
+                },
+            )
+            with (
+                patch(
+                    "gateway.session_context.get_session_env",
+                    side_effect=lambda name, default="": session_values.get(
+                        name, default
+                    ),
+                ),
+                self._patch_mcp_loop(),
+            ):
+                result = json.loads(handler({}))
+
+            assert result["result"] == "ok"
+            mock_session.call_tool.assert_called_once_with(
+                "track_work",
+                arguments={"workspace_path": "/private/session-workspace"},
             )
         finally:
             _servers.pop("test_srv", None)
