@@ -18620,8 +18620,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from agent.context_references import preprocess_context_references_async
                 from agent.model_metadata import get_model_context_length_async
+                from agent.runtime_cwd import resolve_agent_cwd
 
-                _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
+                _msg_cwd = str(resolve_agent_cwd())
                 _msg_config_ctx = None
                 _msg_cfg = None
                 _msg_model_cfg = {}

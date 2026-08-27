@@ -16,6 +16,8 @@ These tests pin the fix: the block must resolve model/provider/base_url via
 the hygiene-compression block already uses) and must actually reach
 ``preprocess_context_references_async`` with a real context length.
 """
+
+import asyncio
 import logging
 import threading
 from contextlib import contextmanager
@@ -28,6 +30,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from gateway.session_context import clear_session_vars, set_session_vars
 
 
 def _make_runner() -> GatewayRunner:
@@ -97,7 +100,9 @@ async def test_at_reference_reaches_preprocessor_with_real_context_length(
 
     captured: dict = {}
 
-    async def _fake_preprocess(message, *, cwd, context_length, url_fetcher=None, allowed_root=None):
+    async def _fake_preprocess(
+        message, *, cwd, context_length, url_fetcher=None, allowed_root=None
+    ):
         captured["message"] = message
         captured["cwd"] = cwd
         captured["context_length"] = context_length
@@ -110,7 +115,9 @@ async def test_at_reference_reaches_preprocessor_with_real_context_length(
 
     import agent.context_references as ctx_mod
 
-    monkeypatch.setattr(ctx_mod, "preprocess_context_references_async", _fake_preprocess)
+    monkeypatch.setattr(
+        ctx_mod, "preprocess_context_references_async", _fake_preprocess
+    )
 
     caplog.set_level(logging.DEBUG, logger="gateway.run")
 
@@ -142,7 +149,65 @@ async def test_at_reference_reaches_preprocessor_with_real_context_length(
 
 
 @pytest.mark.asyncio
-async def test_at_reference_ignores_global_context_for_runtime_route_override(monkeypatch):
+async def test_at_reference_uses_each_concurrent_sessions_task_local_cwd(
+    monkeypatch, tmp_path
+):
+    """Concurrent sessions must never expand @file from another thread's cwd."""
+    runner = _make_runner()
+    source = _source()
+    _patch_runtime_resolution(monkeypatch)
+    fallback = tmp_path / "shared-fallback"
+    first_workspace = tmp_path / "first-workspace"
+    second_workspace = tmp_path / "second-workspace"
+    for directory in (fallback, first_workspace, second_workspace):
+        directory.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(fallback))
+
+    captured = {}
+
+    async def _fake_preprocess(
+        message, *, cwd, context_length, url_fetcher=None, allowed_root=None
+    ):
+        await asyncio.sleep(0)
+        captured[message] = (cwd, allowed_root)
+        return ContextReferenceResult(message=message, original_message=message)
+
+    import agent.context_references as ctx_mod
+
+    monkeypatch.setattr(
+        ctx_mod, "preprocess_context_references_async", _fake_preprocess
+    )
+
+    async def _prepare(label, workspace):
+        tokens = set_session_vars(cwd=str(workspace), cwd_required=True)
+        try:
+            await runner._prepare_inbound_message_text(
+                event=MessageEvent(text=f"@file:{label}.txt", source=source),
+                source=source,
+                history=[],
+            )
+        finally:
+            clear_session_vars(tokens)
+
+    await asyncio.gather(
+        _prepare("first", first_workspace),
+        _prepare("second", second_workspace),
+    )
+
+    assert captured["@file:first.txt"] == (
+        str(first_workspace),
+        str(first_workspace),
+    )
+    assert captured["@file:second.txt"] == (
+        str(second_workspace),
+        str(second_workspace),
+    )
+
+
+@pytest.mark.asyncio
+async def test_at_reference_ignores_global_context_for_runtime_route_override(
+    monkeypatch,
+):
     """Context expansion must not inherit a global pin from another route."""
     runner = _make_runner()
     source = _source()
@@ -183,7 +248,9 @@ async def test_at_reference_ignores_global_context_for_runtime_route_override(mo
     async def _passthrough(message, **_kwargs):
         return ContextReferenceResult(message=message, original_message=message)
 
-    monkeypatch.setattr(model_meta_mod, "get_model_context_length_async", _fake_get_context)
+    monkeypatch.setattr(
+        model_meta_mod, "get_model_context_length_async", _fake_get_context
+    )
     monkeypatch.setattr(ctx_mod, "preprocess_context_references_async", _passthrough)
 
     await runner._prepare_inbound_message_text(
