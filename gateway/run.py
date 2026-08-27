@@ -24740,6 +24740,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 parent
                 and parent.get("ended_at")
                 and str(parent.get("end_reason") or "") == "compression"
+                and str(parent.get("cwd") or "").strip() == stored_cwd
             )
 
         binding = resolve_session_workspace(

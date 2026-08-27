@@ -105,9 +105,7 @@ def test_compression_child_may_reuse_verified_parent_workspace(tmp_path):
     assert child.cwd == parent.cwd
 
 
-@pytest.mark.parametrize("collision", ["root", "profile", "workspace"])
-@pytest.mark.skipif(sys.platform == "win32", reason="symlinks require privileges")
-def test_symlink_or_non_directory_collisions_fail_closed(tmp_path, collision):
+def _assert_symlink_or_non_directory_collision_fails_closed(tmp_path, collision):
     root = tmp_path / "workspaces"
     config = _config(root)
     if collision == "root":
@@ -158,6 +156,18 @@ def test_symlink_or_non_directory_collisions_fail_closed(tmp_path, collision):
             platform="slack",
             static_cwd="/shared/static",
         )
+
+
+@pytest.mark.parametrize("collision", ["root", "profile", "workspace"])
+@pytest.mark.linux_only
+def test_linux_symlink_or_non_directory_collisions_fail_closed(tmp_path, collision):
+    _assert_symlink_or_non_directory_collision_fails_closed(tmp_path, collision)
+
+
+@pytest.mark.parametrize("collision", ["root", "profile", "workspace"])
+@pytest.mark.macos_only
+def test_macos_symlink_or_non_directory_collisions_fail_closed(tmp_path, collision):
+    _assert_symlink_or_non_directory_collision_fails_closed(tmp_path, collision)
 
 
 def test_disabled_ineligible_and_cron_keep_static_cwd(tmp_path):
@@ -219,6 +229,50 @@ def test_invalid_root_and_unexpected_stored_binding_fail_closed(tmp_path):
             platform="slack",
             static_cwd="/shared/static",
         )
+
+
+def test_empty_interrupted_workspace_initialization_recovers_but_nonempty_does_not(
+    tmp_path,
+):
+    binding = _resolve(tmp_path)
+    manifest = binding.path / ".hermes-session-workspace.json"
+    manifest.unlink()
+
+    recovered = _resolve(tmp_path)
+    assert recovered.cwd == binding.cwd
+    assert manifest.is_file()
+
+    manifest.unlink()
+    (binding.path / "partial-output.txt").write_text("keep", encoding="utf-8")
+    with pytest.raises(SessionWorkspaceError, match="non-empty"):
+        _resolve(tmp_path)
+
+
+def test_deleted_expected_stored_workspace_is_rehydrated(tmp_path):
+    binding = _resolve(tmp_path)
+    (binding.path / ".hermes-session-workspace.json").unlink()
+    binding.path.rmdir()
+
+    restored = _resolve(tmp_path, stored_cwd=binding.cwd)
+    assert restored.cwd == binding.cwd
+    assert restored.created is True
+    assert (restored.path / ".hermes-session-workspace.json").is_file()
+
+
+def test_invalid_inherited_workspace_is_rejected_before_permissions_change(tmp_path):
+    foreign = tmp_path / "foreign-inherited"
+    foreign.mkdir(mode=0o755)
+    before = stat.S_IMODE(foreign.stat().st_mode)
+
+    with pytest.raises(SessionWorkspaceError, match="escapes"):
+        _resolve(
+            tmp_path,
+            session_id="compressed-child",
+            stored_cwd=str(foreign),
+            allow_inherited_workspace=True,
+        )
+
+    assert stat.S_IMODE(foreign.stat().st_mode) == before
 
 
 def test_optional_instruction_link_is_safe_and_workspace_local(tmp_path):
@@ -398,6 +452,51 @@ async def test_gateway_compression_child_keeps_parent_workspace(tmp_path, monkey
 
     assert await runner._bind_session_workspace(context) == parent.cwd
     assert db.updates == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_compression_child_rejects_a_cwd_not_bound_to_its_parent(
+    tmp_path, monkeypatch
+):
+    from gateway import run as gateway_run
+    from gateway.run import GatewayRunner
+
+    config = _config(tmp_path / "workspaces")
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config)
+    parent = resolve_session_workspace(
+        config=config,
+        profile="campaign",
+        session_id="parent",
+        platform="slack",
+        static_cwd="/shared/static",
+    )
+    unrelated = resolve_session_workspace(
+        config=config,
+        profile="campaign",
+        session_id="unrelated",
+        platform="slack",
+        static_cwd="/shared/static",
+    )
+    rows = {
+        "parent": {
+            "id": "parent",
+            "cwd": parent.cwd,
+            "ended_at": 1,
+            "end_reason": "compression",
+            "parent_session_id": None,
+        },
+        "child": {
+            "id": "child",
+            "cwd": unrelated.cwd,
+            "parent_session_id": "parent",
+        },
+    }
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = _FakeAsyncSessionDB(rows)
+    runner._active_profile_name = lambda: "campaign"
+
+    with pytest.raises(SessionWorkspaceError, match="does not match"):
+        await runner._bind_session_workspace(_slack_context("child"))
 
 
 @pytest.mark.asyncio

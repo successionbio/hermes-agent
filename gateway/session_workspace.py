@@ -194,6 +194,47 @@ def _enforce_workspace_mode(path: Path) -> None:
         ) from exc
 
 
+def _initialize_expected_workspace(
+    path: Path,
+    *,
+    root: Path,
+    profile_fingerprint: str,
+    workspace_fingerprint: str,
+) -> bool:
+    """Create or recover the exact deterministic workspace safely."""
+    created = _mkdir_checked(path, label="directory")
+    manifest_path = path / _MANIFEST_NAME
+    if created:
+        _write_manifest(
+            path,
+            profile_fingerprint=profile_fingerprint,
+            workspace_fingerprint=workspace_fingerprint,
+        )
+    elif not manifest_path.exists():
+        try:
+            if any(path.iterdir()):
+                raise SessionWorkspaceError(
+                    "session workspace manifest is missing from a non-empty directory"
+                )
+        except SessionWorkspaceError:
+            raise
+        except OSError as exc:
+            raise SessionWorkspaceError(
+                "session workspace directory could not be inspected"
+            ) from exc
+        _write_manifest(
+            path,
+            profile_fingerprint=profile_fingerprint,
+            workspace_fingerprint=workspace_fingerprint,
+        )
+
+    _validate_managed_workspace(
+        path, root=root, profile_fingerprint=profile_fingerprint
+    )
+    _enforce_workspace_mode(path)
+    return created
+
+
 def _install_instructions_link(workspace: Path, raw_path: Any) -> None:
     text = str(raw_path or "").strip()
     if not text:
@@ -295,11 +336,25 @@ def resolve_session_workspace(
         stored_path = Path(stored_text)
         if not stored_path.is_absolute():
             raise SessionWorkspaceError("stored session workspace must be absolute")
-        if stored_path == workspace or allow_inherited_workspace:
-            _enforce_workspace_mode(stored_path)
+        if stored_path == workspace:
+            created = _initialize_expected_workspace(
+                stored_path,
+                root=root,
+                profile_fingerprint=profile_fingerprint,
+                workspace_fingerprint=workspace_fingerprint,
+            )
+            _install_instructions_link(stored_path, cfg.get("instructions_path"))
+            return SessionWorkspaceBinding(
+                cwd=str(stored_path),
+                path=stored_path,
+                isolated=True,
+                created=created,
+            )
+        if allow_inherited_workspace:
             _validate_managed_workspace(
                 stored_path, root=root, profile_fingerprint=profile_fingerprint
             )
+            _enforce_workspace_mode(stored_path)
             _install_instructions_link(stored_path, cfg.get("instructions_path"))
             return SessionWorkspaceBinding(
                 cwd=str(stored_path), path=stored_path, isolated=True
@@ -308,16 +363,11 @@ def resolve_session_workspace(
             "stored session workspace does not match the current persistent session"
         )
 
-    created = _mkdir_checked(workspace, label="directory")
-    _enforce_workspace_mode(workspace)
-    if created:
-        _write_manifest(
-            workspace,
-            profile_fingerprint=profile_fingerprint,
-            workspace_fingerprint=workspace_fingerprint,
-        )
-    _validate_managed_workspace(
-        workspace, root=root, profile_fingerprint=profile_fingerprint
+    created = _initialize_expected_workspace(
+        workspace,
+        root=root,
+        profile_fingerprint=profile_fingerprint,
+        workspace_fingerprint=workspace_fingerprint,
     )
     _install_instructions_link(workspace, cfg.get("instructions_path"))
     return SessionWorkspaceBinding(
