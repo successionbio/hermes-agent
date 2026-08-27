@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 _UNSET: Any = object()
 
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
+_SESSION_CWD_REQUIRED: ContextVar = ContextVar(
+    "HERMES_SESSION_CWD_REQUIRED", default=False
+)
+
+
+class SessionCwdUnavailableError(RuntimeError):
+    """A fail-closed session workspace disappeared after it was bound."""
+
 
 # The Python package/source root (this file lives at <root>/agent/runtime_cwd.py).
 # When a backend is launched from, or self-spawns into, this tree (the desktop
@@ -41,13 +49,15 @@ def _is_install_tree(p: Path) -> bool:
     return p == _PACKAGE_ROOT or _PACKAGE_ROOT in p.parents
 
 
-def set_session_cwd(cwd: str | None) -> Token:
+def set_session_cwd(cwd: str | None, *, required: bool = False) -> Token:
     """Pin the logical cwd for the current context."""
+    _SESSION_CWD_REQUIRED.set(bool(required))
     return _SESSION_CWD.set((cwd or "").strip())
 
 
 def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
+    _SESSION_CWD_REQUIRED.set(False)
 
 
 def _session_cwd_override() -> str:
@@ -57,12 +67,21 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def get_session_cwd_override() -> str:
+    """Return only the task-local CWD, without process-env fallback."""
+    return _session_cwd_override()
+
+
 def resolve_agent_cwd() -> Path:
     override = _session_cwd_override()
     if override:
         p = Path(override).expanduser()
         if p.is_dir():
             return p
+        if _SESSION_CWD_REQUIRED.get():
+            raise SessionCwdUnavailableError(
+                "The bound session workspace is unavailable; local file work is blocked."
+            )
         logger.warning("configured working directory does not exist: %s", override)
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
@@ -86,6 +105,10 @@ def resolve_context_cwd() -> Path | None:
     if override:
         p = Path(override).expanduser()
         if not p.is_dir():
+            if _SESSION_CWD_REQUIRED.get():
+                raise SessionCwdUnavailableError(
+                    "The bound session workspace is unavailable; local file work is blocked."
+                )
             logger.warning("configured working directory does not exist: %s", override)
         else:
             return p

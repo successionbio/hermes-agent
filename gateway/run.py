@@ -19207,6 +19207,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+
+        # Resolve the task-local working directory only after the durable
+        # session row exists. Enabled/eligible sessions fail closed here;
+        # disabled, non-eligible and cron surfaces keep the static terminal.cwd.
+        try:
+            await self._bind_session_workspace(context)
+        except Exception as exc:
+            from gateway.session_workspace import SessionWorkspaceError
+
+            if not isinstance(exc, SessionWorkspaceError):
+                logger.exception("Unexpected session workspace binding failure")
+            else:
+                logger.error(
+                    "Session workspace binding failed for profile=%s platform=%s: %s",
+                    getattr(source, "profile", None) or self._active_profile_name(),
+                    source.platform.value if source.platform else "unknown",
+                    exc,
+                )
+            return (
+                "⚠️ This session's private workspace is unavailable, so local "
+                "terminal and file work is blocked. Check "
+                "terminal.session_workspace in the serving profile and retry."
+            )
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -24644,6 +24667,110 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
 
+    async def _bind_session_workspace(self, context: SessionContext) -> str:
+        """Resolve, validate, and persist this gateway session's CWD."""
+        from gateway.cwd_placeholder import CWD_PLACEHOLDERS
+        from gateway.session_workspace import (
+            SessionWorkspaceError,
+            resolve_session_workspace,
+            session_workspace_is_eligible,
+        )
+
+        try:
+            runtime_config = _load_gateway_config()
+        except Exception as exc:
+            raise SessionWorkspaceError(
+                "serving profile configuration could not be loaded"
+            ) from exc
+
+        terminal_cfg = runtime_config.get("terminal", {})
+        if not isinstance(terminal_cfg, dict):
+            terminal_cfg = {}
+        configured_static = str(terminal_cfg.get("cwd") or "").strip()
+        if not configured_static or configured_static in CWD_PLACEHOLDERS:
+            static_cwd = str(os.environ.get("TERMINAL_CWD") or "").strip()
+        else:
+            static_cwd = os.path.expanduser(configured_static)
+
+        platform = context.source.platform.value if context.source.platform else ""
+        if not session_workspace_is_eligible(
+            runtime_config, platform=platform, cron_session=False
+        ):
+            binding = resolve_session_workspace(
+                config=runtime_config,
+                profile=getattr(context.source, "profile", "") or "default",
+                session_id=context.session_id,
+                platform=platform,
+                static_cwd=static_cwd,
+            )
+            context.cwd = binding.cwd
+            context.cwd_required = False
+            return binding.cwd
+
+        profile = str(
+            getattr(context.source, "profile", "") or self._active_profile_name()
+        ).strip() or "default"
+        session_db = self._session_db
+        if session_db is None:
+            raise SessionWorkspaceError(
+                "session database is unavailable; workspace binding was not persisted"
+            )
+        try:
+            row = await session_db.get_session(context.session_id)
+        except Exception as exc:
+            raise SessionWorkspaceError(
+                "session record could not be loaded for workspace validation"
+            ) from exc
+        if not row:
+            raise SessionWorkspaceError(
+                "session record is missing; workspace binding was not persisted"
+            )
+
+        stored_cwd = str(row.get("cwd") or "").strip()
+        allow_inherited_workspace = False
+        parent_session_id = str(row.get("parent_session_id") or "").strip()
+        if stored_cwd and parent_session_id:
+            try:
+                parent = await session_db.get_session(parent_session_id)
+            except Exception as exc:
+                raise SessionWorkspaceError(
+                    "session workspace lineage could not be validated"
+                ) from exc
+            allow_inherited_workspace = bool(
+                parent
+                and parent.get("ended_at")
+                and str(parent.get("end_reason") or "") == "compression"
+            )
+
+        binding = resolve_session_workspace(
+            config=runtime_config,
+            profile=profile,
+            session_id=context.session_id,
+            platform=platform,
+            static_cwd=static_cwd,
+            stored_cwd=stored_cwd,
+            allow_inherited_workspace=allow_inherited_workspace,
+        )
+        if stored_cwd != binding.cwd:
+            try:
+                generation = await session_db.update_session_cwd(
+                    context.session_id,
+                    binding.cwd,
+                    replace_git_meta=True,
+                )
+            except Exception as exc:
+                raise SessionWorkspaceError(
+                    "session workspace binding could not be persisted"
+                ) from exc
+            if generation is None:
+                raise SessionWorkspaceError(
+                    "session workspace binding was not accepted by the session store"
+                )
+
+        context.cwd = binding.cwd
+        context.cwd_required = True
+        return binding.cwd
+
     def _set_session_env(self, context: SessionContext) -> list:
         """Set session context variables for the current async task.
 
@@ -24664,7 +24791,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        return set_session_vars(
+        tokens = set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_type=(
@@ -24677,11 +24804,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            cwd=context.cwd,
+            cwd_required=context.cwd_required,
             async_delivery=_async_delivery,
             cron_session="",
         )
+        if context.cwd and context.session_id:
+            try:
+                from tools.terminal_tool import register_task_env_overrides
+
+                register_task_env_overrides(
+                    context.session_id,
+                    {
+                        "cwd": context.cwd,
+                        "cwd_source": (
+                            "session" if context.cwd_required else "process"
+                        ),
+                    },
+                )
+            except Exception:
+                if context.cwd_required:
+                    from gateway.session_context import clear_session_vars
+
+                    clear_session_vars(tokens)
+                    raise
+                logger.debug("static session cwd registration failed", exc_info=True)
+        return tokens
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""

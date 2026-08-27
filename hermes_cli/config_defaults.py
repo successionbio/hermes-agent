@@ -382,6 +382,16 @@ DEFAULT_CONFIG = {
         # preserves the historical error + traceback behavior.
         "degraded_mode": "warn",
         "cwd": ".",  # Use current directory
+        # Optional per-durable-session workspace isolation for messaging
+        # gateways. Disabled by default; non-eligible platforms and cron keep
+        # using terminal.cwd. The root and optional instruction link must be
+        # absolute paths when enabled.
+        "session_workspace": {
+            "enabled": False,
+            "root": "",
+            "platforms": ["slack"],
+            "instructions_path": "",
+        },
         # Terminal font family for the desktop app's embedded xterm.js terminal.
         # When set (e.g. "'CaskaydiaCoveNerdFont', 'JetBrains Mono', monospace"),
         # the desktop terminal uses this as the CSS font-family value, with the

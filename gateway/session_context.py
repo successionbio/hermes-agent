@@ -102,6 +102,9 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
+_SESSION_WORKSPACE: ContextVar = ContextVar(
+    "HERMES_SESSION_WORKSPACE", default=_UNSET
+)
 _BROWSER_CONTROL_PRINCIPAL: ContextVar = ContextVar(
     "HERMES_BROWSER_CONTROL_PRINCIPAL", default=_UNSET
 )
@@ -157,6 +160,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_SESSION_WORKSPACE": _SESSION_WORKSPACE,
     "HERMES_BROWSER_CONTROL_PRINCIPAL": _BROWSER_CONTROL_PRINCIPAL,
     "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY": _BROWSER_CONTROL_TRANSPORT_FAMILY,
     "HERMES_CRON_SESSION": _CRON_SESSION,
@@ -239,6 +243,7 @@ def set_session_vars(
     browser_control_principal: str = "",
     browser_control_transport_family: str = "",
     cwd: str = "",
+    cwd_required: bool = False,
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
@@ -283,6 +288,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _SESSION_WORKSPACE.set(cwd if cwd_required else ""),
         _BROWSER_CONTROL_PRINCIPAL.set(browser_control_principal),
         _BROWSER_CONTROL_TRANSPORT_FAMILY.set(browser_control_transport_family),
         _CRON_SESSION.set(cron_session),
@@ -291,7 +297,7 @@ def set_session_vars(
     try:
         from agent.runtime_cwd import set_session_cwd
 
-        set_session_cwd(cwd)
+        set_session_cwd(cwd, required=cwd_required)
     except Exception:
         pass
     return tokens
@@ -324,6 +330,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_WORKSPACE,
         _BROWSER_CONTROL_PRINCIPAL,
         _BROWSER_CONTROL_TRANSPORT_FAMILY,
         _CRON_SESSION,
