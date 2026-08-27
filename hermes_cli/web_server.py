@@ -101,7 +101,7 @@ from gateway.status import (
     read_runtime_status,
     resolve_gateway_liveness,
 )
-from utils import env_var_enabled
+from utils import env_var_enabled, is_truthy_value
 
 try:
     from fastapi import (
@@ -261,6 +261,25 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
 # asyncio.Lock() binds to whatever loop was active at import time, which breaks
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
+
+def _desktop_cron_ticker_enabled() -> bool:
+    """Return whether this Desktop backend should own the cron scheduler.
+
+    Desktop owns cron by default.  A profile hosted beside dedicated gateway
+    processes can opt out so the process-global MCP registry in the pooled
+    Desktop backend cannot execute another profile's scheduled work.
+    """
+    try:
+        config = load_config() or {}
+    except Exception:
+        _log.exception("Desktop cron: config load failed; keeping scheduler enabled")
+        return True
+
+    cron_config = config.get("cron") if isinstance(config, dict) else None
+    if not isinstance(cron_config, dict):
+        return True
+    return is_truthy_value(cron_config.get("desktop_scheduler"), default=True)
+
 
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
@@ -445,14 +464,17 @@ async def _lifespan(app: "FastAPI"):
         except Exception:
             _log.exception("Desktop startup: orphan gateway reap failed")
 
-        cron_stop = threading.Event()
-        cron_thread = threading.Thread(
-            target=_start_desktop_cron_ticker,
-            args=(cron_stop,),
-            daemon=True,
-            name="desktop-cron-ticker",
-        )
-        cron_thread.start()
+        if _desktop_cron_ticker_enabled():
+            cron_stop = threading.Event()
+            cron_thread = threading.Thread(
+                target=_start_desktop_cron_ticker,
+                args=(cron_stop,),
+                daemon=True,
+                name="desktop-cron-ticker",
+            )
+            cron_thread.start()
+        else:
+            _log.info("Desktop cron scheduler disabled by cron.desktop_scheduler")
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))

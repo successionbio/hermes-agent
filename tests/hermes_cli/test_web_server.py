@@ -4794,6 +4794,25 @@ class TestDesktopCronTicker:
         with self._client():
             assert called.wait(3.0), "expected cron tick under HERMES_DESKTOP=1"
 
+    def test_ticker_does_not_run_when_disabled_in_config(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        import threading
+        import cron.scheduler as sched
+        import hermes_cli.web_server as ws
+
+        called = threading.Event()
+        monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
+        monkeypatch.setattr(
+            ws,
+            "load_config",
+            lambda: {"cron": {"desktop_scheduler": False}},
+        )
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+
+        with self._client():
+            assert not called.wait(0.25), "desktop cron ticker ignored its config opt-out"
+
 
 class TestServeIndexMissingIndex:
     """_serve_index must not raise per-request when index.html vanishes
