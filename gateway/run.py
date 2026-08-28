@@ -49,6 +49,7 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -130,6 +131,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    r"|context\s+compaction\s+complete\s+[—-]\s+continuing\s+turn"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
@@ -338,6 +340,7 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
         _status_template_to_regex(_template)
         for _template in (
             COMPACTION_STATUS,
+            COMPACTION_DONE_STATUS,
             PRE_API_COMPRESSION_STATUS_TEMPLATE,
             PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
             IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -4698,6 +4701,13 @@ class TurnRunner:
                 if getattr(result, "success", False):
                     return
                 native_failed = True
+                if not ctx.tool_progress_enabled:
+                    logger.warning(
+                        "Slack native task-card progress failed; text fallback "
+                        "is disabled by display.tool_progress: %s",
+                        getattr(result, "error", "unknown error"),
+                    )
+                    return
                 logger.warning(
                     "Slack native task-card progress failed; falling back "
                     "to an editable text update: %s",
@@ -4705,6 +4715,8 @@ class TurnRunner:
                 )
             # Once the native rail fails, every later lifecycle event
             # edits the same fallback message so progress remains live.
+            if not ctx.tool_progress_enabled:
+                return
             await _send_or_edit_fallback()
 
         def _drain_native_queue() -> bool:

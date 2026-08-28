@@ -3,6 +3,7 @@
 import pytest
 
 from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
@@ -163,6 +164,14 @@ def test_all_routine_compression_statuses_suppressed_from_source_constants(
     the literal into this file.
     """
     assert _prepare_gateway_status_message(platform, "lifecycle", message) is None
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_compaction_completion_is_suppressed_on_chat_platforms(platform):
+    assert (
+        _prepare_gateway_status_message(platform, "compacted", COMPACTION_DONE_STATUS)
+        is None
+    )
 
 
 @pytest.mark.parametrize("platform", CHAT_PLATFORMS)

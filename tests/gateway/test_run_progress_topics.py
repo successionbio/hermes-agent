@@ -1104,7 +1104,7 @@ async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id
 
 
 @pytest.mark.asyncio
-async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
+async def test_slack_native_failure_stays_silent_when_text_progress_is_off(
     monkeypatch, tmp_path
 ):
     adapter, result = await _run_with_agent(
@@ -1112,6 +1112,33 @@ async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
         tmp_path,
         DuplicateNativeToolsAgent,
         session_id="sess-native-fallback",
+        platform=Platform.SLACK,
+        chat_id="C1",
+        thread_id="thread-1",
+        adapter_cls=FailingNativeTaskCardAdapter,
+        user_id="U1",
+        scope_id="T1",
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.native_updates) == 1
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert adapter.native_stops == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_native_failure_keeps_one_text_fallback_when_enabled(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        DuplicateNativeToolsAgent,
+        session_id="sess-native-fallback-enabled",
+        config_data={
+            "display": {"platforms": {"slack": {"tool_progress": "all"}}}
+        },
         platform=Platform.SLACK,
         chat_id="C1",
         thread_id="thread-1",
