@@ -3635,6 +3635,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    route: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
@@ -3661,6 +3662,10 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The optional 'route' selects a trusted provider/model alias configured
+    under delegation.routes. Models cannot supply raw provider credentials or
+    arbitrary model IDs through this parameter.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3742,11 +3747,35 @@ def delegate_task(
     # uses it to route its reviewer subagent onto ``auxiliary.review``
     # without touching the global delegation pin.
     try:
+        if route and credentials_cfg:
+            raise ValueError(
+                "delegate_task cannot combine a named route with an internal "
+                "credential override."
+            )
+        effective_credentials_cfg = (
+            credentials_cfg
+            if credentials_cfg
+            else _resolve_named_delegation_route(route, cfg)
+        )
         creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
+            effective_credentials_cfg, parent_agent
         )
     except ValueError as exc:
         return tool_error(str(exc))
+
+    route_toolsets = None
+    if route:
+        configured_toolsets = effective_credentials_cfg.get("toolsets")
+        if configured_toolsets is not None:
+            if not isinstance(configured_toolsets, list) or not all(
+                isinstance(name, str) and name.strip()
+                for name in configured_toolsets
+            ):
+                return tool_error(
+                    f"Delegation route '{str(route).strip()}' has invalid "
+                    "toolsets; expected a list of non-empty toolset names."
+                )
+            route_toolsets = [name.strip() for name in configured_toolsets]
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3886,9 +3915,10 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=_child_context,
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                # The model cannot choose toolsets. A trusted named route may
+                # narrow them through operator configuration; otherwise the
+                # child inherits the parent's toolsets.
+                toolsets=route_toolsets,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -4288,9 +4318,9 @@ def delegate_task(
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
-            # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
-            toolsets=None,
+            # Metadata for the completion block only. The children were built
+            # above with this same trusted route restriction.
+            toolsets=route_toolsets,
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
@@ -4639,6 +4669,77 @@ def _load_config() -> dict:
         return {}
 
 
+def _configured_delegation_route_names(cfg: Optional[dict] = None) -> List[str]:
+    """Return sorted, model-visible delegation route aliases.
+
+    Route definitions are trusted operator configuration. Invalid entries are
+    omitted from the tool schema instead of advertising aliases that cannot be
+    resolved at runtime.
+    """
+    config = cfg if isinstance(cfg, dict) else _load_config()
+    routes = config.get("routes")
+    if not isinstance(routes, dict):
+        return []
+    return sorted(
+        name.strip()
+        for name, definition in routes.items()
+        if isinstance(name, str)
+        and name.strip()
+        and isinstance(definition, dict)
+    )
+
+
+def _configured_delegation_route_description(
+    route_names: List[str], cfg: Optional[dict] = None
+) -> str:
+    """Build a compact model-facing description of trusted route aliases."""
+    config = cfg if isinstance(cfg, dict) else _load_config()
+    routes = config.get("routes")
+    if not isinstance(routes, dict):
+        return ""
+
+    details = []
+    for name in route_names:
+        definition = routes.get(name)
+        description = (
+            str(definition.get("description") or "").strip()
+            if isinstance(definition, dict)
+            else ""
+        )
+        details.append(f"{name}: {description}" if description else name)
+    return "; ".join(details)
+
+
+def _resolve_named_delegation_route(route: Optional[str], cfg: dict) -> dict:
+    """Resolve a trusted route alias into a delegation credential config.
+
+    A route inherits the base delegation provider settings and overrides only
+    the keys explicitly configured for that alias. The model selects the alias,
+    never a provider, model ID, endpoint, or credential directly.
+    """
+    if not isinstance(cfg, dict):
+        cfg = {}
+    route_name = str(route or "").strip()
+    if not route_name:
+        return cfg
+
+    routes = cfg.get("routes")
+    definition = routes.get(route_name) if isinstance(routes, dict) else None
+    if not isinstance(definition, dict):
+        available = _configured_delegation_route_names(cfg)
+        suffix = (
+            f" Configured routes: {', '.join(available)}."
+            if available
+            else " No routes are configured."
+        )
+        raise ValueError(f"Unknown delegation route '{route_name}'.{suffix}")
+
+    resolved = dict(cfg)
+    resolved.pop("routes", None)
+    resolved.update(definition)
+    return resolved
+
+
 # ---------------------------------------------------------------------------
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
@@ -4655,6 +4756,18 @@ def _build_top_level_description() -> str:
     top-level text stays static and duplication-free. If you add text
     here, check it is not already stated in a parameter description.
     """
+    route_names = _configured_delegation_route_names()
+    model_note = (
+        "- Children use the selected operator-configured route, else the "
+        "global delegation pin or parent model. Results are returned as an "
+        "array, one entry per task."
+        if route_names
+        else (
+            "- Children inherit the parent model and fallback chain unless "
+            "pinned globally via delegation.provider / delegation.model in "
+            "config.yaml. Results are returned as an array, one entry per task."
+        )
+    )
     return (
         "Spawn subagents in isolated contexts; each gets its own conversation, "
         "terminal session, and toolset, and only its final summary returns to "
@@ -4691,9 +4804,7 @@ def _build_top_level_description() -> str:
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        f"{model_note}"
     )
 
 
@@ -4764,6 +4875,21 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    route_names = _configured_delegation_route_names()
+    if route_names:
+        route_details = _configured_delegation_route_description(route_names)
+        overrides_params["properties"]["route"] = {
+            "type": "string",
+            "enum": route_names,
+            "description": (
+                "Trusted delegation route for this entire call. Each alias "
+                "maps to an operator-configured provider/model policy. Omit "
+                "to use the default delegation model. Configured routes: "
+                f"{route_details}."
+            ),
+        }
+    else:
+        overrides_params["properties"].pop("route", None)
 
     return {
         "description": _build_top_level_description(),
@@ -4845,6 +4971,10 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "route": {
+                "type": "string",
+                "description": "(configured aliases are rebuilt at get_definitions() time)",
             },
             "output_schema": {
                 "type": "object",
@@ -4957,6 +5087,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        route=args.get("route"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),
